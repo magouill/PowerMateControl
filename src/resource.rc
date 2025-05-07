@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDI_ICON_CONNECTED    ICON "../res/connected.ico"
+IDI_ICON_DISCONNECTED ICON "../res/disconnected.ico"
