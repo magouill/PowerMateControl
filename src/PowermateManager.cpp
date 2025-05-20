@@ -7,34 +7,32 @@
 #include <vector>
 #include <dbt.h>
 #include <mutex>
+#include <thread>
 
+// Static variable definitions
 std::atomic<bool> PowermateManager::running(false);
 std::atomic<bool> PowermateManager::connected(false);
 std::atomic<HANDLE> PowermateManager::hDevice{ INVALID_HANDLE_VALUE };
 std::thread PowermateManager::inputThread;
 std::mutex PowermateManager::deviceMutex;
 
-DWORD PowermateManager::pressStartTime = 0;
-bool PowermateManager::isLongPress = false;
-const DWORD PowermateManager::LONG_PRESS_THRESHOLD = 1000;
-
 // Find Powermate device Path
 bool PowermateManager::FindPowerMateDevicePath(std::wstring& out) {
     GUID g; HidD_GetHidGuid(&g);
-    HDEVINFO h = SetupDiGetClassDevs(&g, 0, 0, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    HDEVINFO h = SetupDiGetClassDevs(&g, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (h == INVALID_HANDLE_VALUE) return false;
 
     SP_DEVICE_INTERFACE_DATA d = { sizeof(d) };
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(h, 0, &g, i, &d); ++i) {
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(h, nullptr, &g, i, &d); ++i) {
         DWORD sz = 0;
-        SetupDiGetDeviceInterfaceDetail(h, &d, 0, 0, &sz, 0);
+        SetupDiGetDeviceInterfaceDetail(h, &d, nullptr, 0, &sz, nullptr);
         if (!sz) continue;
 
         std::vector<BYTE> b(sz);
         auto p = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(b.data());
         p->cbSize = sizeof(*p);
 
-        if (SetupDiGetDeviceInterfaceDetail(h, &d, p, sz, 0, 0)) {
+        if (SetupDiGetDeviceInterfaceDetail(h, &d, p, sz, nullptr, nullptr)) {
             std::wstring s = p->DevicePath;
             if (s.find(L"vid_077d") != std::wstring::npos && s.find(L"pid_0410") != std::wstring::npos) {
                 out = s;
@@ -55,35 +53,29 @@ bool PowermateManager::IsConnected() {
 
 // Find and open the device
 bool PowermateManager::FindAndOpenDevice() {
-    if (IsConnected()) return true;
-
-    // Grab device path
-    std::wstring path; 
+    std::wstring path;
     if (!FindPowerMateDevicePath(path)) {
-        std::cerr << "[Debug] PowerMate device not found\n";
+        std::cerr << "[Debug] Powermate device not found\n";
         return false;
     }
 
-    // Close old handle if valid
-    HANDLE oldHandle = hDevice.load();
-    if (oldHandle != INVALID_HANDLE_VALUE) {
-        CloseHandle(oldHandle);
-        hDevice.store(INVALID_HANDLE_VALUE); // Reset handle
-    } 
-
-    // Open the device
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+                           OPEN_EXISTING, 0, nullptr);
+
     if (h == INVALID_HANDLE_VALUE) {
         std::cerr << "[Debug] Failed to open Powermate\n";
         return false;
     }
 
-    hDevice.store(h);
-    connected.store(true);
-    StartReading();
+    {
+        std::lock_guard<std::mutex> lock(deviceMutex);
+        hDevice.store(h);
+        connected.store(true);
+    }
+
     std::cerr << "[Debug] Powermate device connected\n";
+
     return true;
 }
 
@@ -91,10 +83,10 @@ bool PowermateManager::FindAndOpenDevice() {
 void PowermateManager::StartReading() {
     std::lock_guard<std::mutex> lock(deviceMutex);
 
-    if (running) return;
-    if (!IsConnected() || hDevice.load() == INVALID_HANDLE_VALUE) return;
+    if (running.load()) return;
+    if (!IsConnected()) return;
 
-    running = true;
+    running.store(true);
     inputThread = std::thread(&PowermateManager::InputLoop);
 }
 
@@ -102,129 +94,135 @@ void PowermateManager::StartReading() {
 void PowermateManager::HandleDeviceChange(WPARAM wParam) {
     std::wstring path;
 
-    if (wParam == DBT_DEVICEARRIVAL && FindAndOpenDevice()) return;
-
-    else if (wParam == DBT_DEVICEREMOVECOMPLETE) {
+    if (wParam == DBT_DEVICEARRIVAL && FindAndOpenDevice()) {
+        StartReading();
+        return;
+    } else if (wParam == DBT_DEVICEREMOVECOMPLETE) {
         if (FindPowerMateDevicePath(path)) {
             std::wcerr << L"[Debug] Powermate is still connected\n";
         } else {
             std::wcerr << L"[Debug] Powermate is no longer connected\n";
-            connected.store(false);
             Stop();
         }
-    } 
-    else if (wParam == PBT_APMSUSPEND) {
-        std::wcout << L"[Debug] Suspending, stopping device\n";
-        Stop();
-    } 
+    } else if (wParam == PBT_APMSUSPEND) {
+    std::wcout << L"[Debug] Suspending, stopping device\n";
+    Stop();
+    }
     else if (wParam == PBT_APMRESUMESUSPEND) {
-        if (FindAndOpenDevice()) {
-        } else {
-            connected.store(false);
-            std::wcerr << L"[Debug] Device could not found after system resume\n";
+        if (!IsConnected()) {
+            if (FindAndOpenDevice()) {
+                std::wcout << L"[Debug] Reconnected after system resume\n";
+            } else {
+                connected.store(false);
+                std::wcerr << L"[Debug] Failed to reconnect Powermate after resume\n";
+            }
         }
     }
 }
 
-
-// Intercepting device inputs
+// The input reading loop
 void PowermateManager::InputLoop() {
-    OVERLAPPED overlapped = {};
-    overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    if (!overlapped.hEvent) {
-        std::cerr << "[Error] Failed to create overlapped event\n";
-        return;
-    }
-
     unsigned char buffer[8] = {};
     DWORD bytesRead = 0;
     bool buttonDown = false;
-    DWORD pressStartTime = 0;
-    bool isLongPress = false;
+    int backoffMs = 1000;
 
-    while (running && connected) {
-        ResetEvent(overlapped.hEvent);
-
-        if (!ReadFile(hDevice, buffer, sizeof(buffer), nullptr, &overlapped)) {
-            DWORD err = GetLastError();
-            if (err == ERROR_DEVICE_NOT_CONNECTED) {
-                std::cerr << "[Error] Device no longer connected\n";
-                connected = false;
-                break;
-            }
-
-            if (err == ERROR_IO_PENDING) {
-                DWORD wait = WaitForSingleObject(overlapped.hEvent, 50);
-                if (wait == WAIT_OBJECT_0) {
-                    if (!GetOverlappedResult(hDevice, &overlapped, &bytesRead, FALSE)) break;
-                } else if (wait == WAIT_TIMEOUT) {
-                    // Handle Long press logic
-                    if (buttonDown && !isLongPress && GetTickCount() - pressStartTime >= LONG_PRESS_THRESHOLD) {
-                        std::cout << "LONG PRESS DETECTED\n";
-                        HandleInput(PowermateInputType::LONG_PRESS);
-                        MessageBeep(MB_ICONASTERISK);
-                        isLongPress = true;
-                    }
-                    continue;
-                } else break;
+    while (running.load()) {
+        if (!IsConnected()) {
+            if (FindAndOpenDevice()) {
+                std::cout << "[Info] Device reconnected\n";
+                backoffMs = 1000;
             } else {
-                std::cerr << "[Error] ReadFile failed: " << err << "\n";
-                break;
+                std::cerr << "[Debug] Waiting for device...\n";
+                Sleep(backoffMs);
+                backoffMs = (backoffMs * 2 < 10000) ? backoffMs * 2 : 10000;
+                continue;
             }
+        }
+
+        HANDLE h;
+        {
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            h = hDevice.load();
+        }
+
+        if (h == INVALID_HANDLE_VALUE) {
+            Sleep(1000);
+            continue;
+        }
+
+        if (!ReadFile(h, buffer, sizeof(buffer), &bytesRead, nullptr)) {
+            DWORD err = GetLastError();
+            std::cerr << "[Error] ReadFile failed: " << err << "\n";
+
+            if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_INVALID_HANDLE) {
+                connected.store(false);
+                {
+                    std::lock_guard<std::mutex> lock(deviceMutex);
+                    if (hDevice.load() != INVALID_HANDLE_VALUE) {
+                        CloseHandle(hDevice.load());
+                        hDevice.store(INVALID_HANDLE_VALUE);
+                    }
+                }
+                break; // Exit thread on device removal
+            }
+
+            connected.store(false);
+            {
+                std::lock_guard<std::mutex> lock(deviceMutex);
+                if (hDevice.load() != INVALID_HANDLE_VALUE) {
+                    CloseHandle(hDevice.load());
+                    hDevice.store(INVALID_HANDLE_VALUE);
+                }
+            }
+            break;
         }
 
         if (bytesRead < 3) continue;
 
-        // Handle rotation
         int8_t rotation = static_cast<int8_t>(buffer[2]);
         if (rotation != 0) {
-            std::cout << (rotation < 0 ? "ROTATE RIGHT" : "ROTATE LEFT") << " (" << static_cast<int>(rotation) << ")\n";
+            std::cout << (rotation < 0 ? "ROTATE RIGHT" : "ROTATE LEFT") << std::endl;
             HandleInput(rotation < 0 ? PowermateInputType::ROTATE_RIGHT : PowermateInputType::ROTATE_LEFT);
         }
 
-        // Handle Button press/release
         bool isPressed = buffer[1] == 1;
         if (isPressed != buttonDown) {
+            std::cout << (isPressed ? "BUTTON PRESSED" : "BUTTON RELEASED") << "\n";
             buttonDown = isPressed;
-            if (buttonDown) {
-                pressStartTime = GetTickCount();
-                isLongPress = false;
-                std::cout << "BUTTON PRESSED\n";
-            } else {
-                std::cout << "BUTTON RELEASED\n";
-                if (!isLongPress) HandleInput(PowermateInputType::BUTTON_RELEASE);
+            if (!isPressed) {
+                HandleInput(PowermateInputType::BUTTON_RELEASE);
             }
         }
     }
 
-    CloseHandle(overlapped.hEvent);
+    running.store(false);
 }
 
-// Forward input to TriggerAction
+
+// Forward input to TriggerAction handler
 void PowermateManager::HandleInput(PowermateInputType inputType) {
     TriggerAction::HandleAction(inputType);
 }
 
-// Stop reading inputs
+// Stop reading inputs and close device
 void PowermateManager::Stop() {
-    std::lock_guard<std::mutex> lock(deviceMutex);
-    if (!running) return;
-    running = false;
-    connected.store(false);
-    if (hDevice.load() != INVALID_HANDLE_VALUE) {
-        CancelIo(hDevice.load());
-    }
+    running.store(false);
+
     if (inputThread.joinable()) {
         inputThread.join();
     }
+
     CloseDevice();
 }
 
-// Close the device handle
+// Close device handle and mark as invalid
 void PowermateManager::CloseDevice() {
+    std::lock_guard<std::mutex> lock(deviceMutex);
     HANDLE device = hDevice.load();
     if (device != INVALID_HANDLE_VALUE) {
         CloseHandle(device);
         hDevice.store(INVALID_HANDLE_VALUE);
     }
+    connected.store(false);
 }

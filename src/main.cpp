@@ -41,21 +41,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR cmdLine, int) {
         return -1;
     }
 
-    PowermateManager::FindAndOpenDevice();
+    if (PowermateManager::FindAndOpenDevice()) {
+    PowermateManager::StartReading();
+    }
     trayIcon.InitTrayIcon(hwnd);
 
     SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&trayIcon));
 
     MSG msg = {};
-    while (GetMessage(&msg, nullptr, 0, 0)) {
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-
-    if (msg.message == WM_CLOSE) {
-        // Stop App 
-        PowermateManager::Stop();
-    }
+    PowermateManager::Stop();
 
     CloseHandle(hMutex);
     return static_cast<int>(msg.wParam);

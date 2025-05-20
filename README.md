@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="res/connected.png" alt="Logo" width="150" height="150">
+  <img src="res/logo.png" alt="Logo" width="150" height="150">
   <h3 align="center">PowerMateControl</h3>
 
   <p align="center">
@@ -12,9 +12,18 @@
 ---
 
 PowerMateControl is a Windows system tray application designed for Windows 11.  
-It provides functionality for the Griffin PowerMate USB device, with no plans to support the Bluetooth version.
-
-This program offers two distinct profiles:
-
-- **Scroll**: Sends mouse scroll actions.  
-- **Volume**: Controls the system volume (up, down, mute).
+It provides functionality for the Griffin PowerMate USB device. There is no plans to support the Bluetooth version.
+<table>
+  <tr>
+    <td>
+      <img src="res/screenshot1.png" alt="screenshot1" width="170">
+    </td>
+    <td style="text-align: left; vertical-align: width: 45%;">
+      <p>This program offers two distinct profiles:</p>
+      <ul>
+        <li><strong>Scroll</strong>: Sends mouse scroll actions.</li>
+        <li><strong>Volume</strong>: Controls the system volume.</li>
+      </ul>
+    </td>
+  </tr>
+</table>
